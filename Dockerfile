@@ -18,7 +18,6 @@ COPY . .
 
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
-ENV PORT=3366
 
 EXPOSE 3366
 
