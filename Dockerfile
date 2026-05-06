@@ -8,7 +8,7 @@ RUN apt-get update \
   && curl -fsSL https://dl.k6.io/key.gpg | gpg --dearmor -o /etc/apt/keyrings/k6-archive-keyring.gpg \
   && echo "deb [signed-by=/etc/apt/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" > /etc/apt/sources.list.d/k6.list \
   && apt-get update \
-  && apt-get install -y --no-install-recommends k6 \
+  && apt-get install -y --no-install-recommends k6 xvfb xauth \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./

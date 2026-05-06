@@ -435,7 +435,7 @@ function createMirroredBroadcaster(base: { broadcast: (event: DashboardEvent) =>
 
 async function run(): Promise<void> {
   const liveMode = resolveLiveMode();
-  const config: RunnerConfig = {
+  let config: RunnerConfig = {
     registerUrl: requireEnv('REGISTER_URL'),
     userCount: num('USER_COUNT', 100),
     usersFile: requireEnv('USERS_FILE'),
@@ -454,6 +454,15 @@ async function run(): Promise<void> {
     userOffset: Math.max(0, num('USER_OFFSET', 0)),
     deleteArtifactsOnFinish: bool('DELETE_ARTIFACTS_ON_FINISH', false),
   };
+  const hasDisplay = Boolean(process.env['DISPLAY'] || process.env['WAYLAND_DISPLAY']);
+  if (!hasDisplay && (!config.headless || config.headedUsers > 0)) {
+    console.warn('[live-runner] no DISPLAY/WAYLAND_DISPLAY detected; forcing headless mode');
+    config = {
+      ...config,
+      headless: true,
+      headedUsers: 0,
+    };
+  }
 
   const parsed = parseExamRegisterUrl(config.registerUrl);
   const users = loadUsersFromFile(config.usersFile, config.userCount, config.userOffset);

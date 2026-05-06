@@ -1,5 +1,5 @@
 import express from 'express';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -174,6 +174,8 @@ app.post('/api/start', (req, res) => {
   const b = req.body || {};
   const mode = String(b.testMode || 'headless');
   const dashboardPort = Number(b.dashboardPort || 3360);
+  const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+  const wantsHeaded = mode === 'headed' || Number(b.headedUsers || 0) > 0;
   const env = {
     ...process.env,
     REGISTER_URL: String(b.registerUrl || ''),
@@ -207,6 +209,17 @@ app.post('/api/start', (req, res) => {
   let cmd = ['npm', 'run', 'e2e:live-runner'];
   if (mode === 'hybrid') cmd = ['npm', 'run', 'e2e:live-with-k6'];
   if (mode === 'k6') cmd = ['k6', 'run', env.K6_SCRIPT];
+  if (!hasDisplay && wantsHeaded && mode !== 'k6') {
+    const probe = spawnSync('xvfb-run', ['--help'], { stdio: 'ignore' });
+    if (probe.error) {
+      return res.status(500).json({
+        error:
+          'Headed mode requires an X server. xvfb-run is not available in this runtime; install xvfb or switch to headless mode.',
+      });
+    }
+    pushLog('[info] No DISPLAY found; running headed browser under xvfb-run virtual display.');
+    cmd = ['xvfb-run', '-a', ...cmd];
+  }
 
   liveCards.clear();
 

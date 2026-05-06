@@ -23,6 +23,7 @@ Notes:
 - Live preview is now served from the same public service URL at `/dashboard` (no second public port needed).
 - `DASHBOARD_PORT` is internal for the child runner process only.
 - For `k6` and `hybrid` modes on Railway, deploy with the provided `Dockerfile` so `k6` is installed.
+- For `headed test` on Railway, deploy with the provided `Dockerfile`; it includes `xvfb`, and the runner will use `xvfb-run` automatically when no display is present.
 
 Required in UI when starting browser tests:
 - `Register URL`
