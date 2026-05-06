@@ -123,7 +123,7 @@ function validateForm(){
 document.getElementById('startBtn').onclick=async()=>{ const payload={registerUrl:v('registerUrl'),usersFile:v('usersFile'),testMode:v('testMode'),userCount:Number(v('userCount')),userOffset:Number(v('userOffset')),headedUsers:Number(v('headedUsers')),maxConcurrentUsers:Number(v('maxConcurrent')),dashboardPort:Number(v('dashboardPort')),liveMode:v('liveMode'),screenshotMs:Number(v('screenshotMs')),jpegQuality:Number(v('jpegQuality')),k6BaseUrl:v('k6BaseUrl'),k6Script:v('k6Script'),k6Students:Number(v('k6Students')),deleteAfterFinish:c('deleteAfterFinish')}; const resp=await fetch('/api/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)}); const data=await resp.json().catch(()=>({})); if(!resp.ok){ alert(data.error||('Start failed: HTTP '+resp.status)); return; } alert('Started'); await refresh(); };
 document.getElementById('stopBtn').onclick=async()=>{ await fetch('/api/stop',{method:'POST'}); await refresh(); };
 ['testMode','registerUrl','usersFile'].forEach((id)=>document.getElementById(id).addEventListener('input',validateForm));
-const es=new EventSource('/api/logs'); es.onmessage=(e)=>{ const m=JSON.parse(e.data); logsEl.textContent+=m.line+'\n'; logsEl.scrollTop=logsEl.scrollHeight;};
+const es=new EventSource('/api/logs'); es.onmessage=(e)=>{ const m=JSON.parse(e.data); logsEl.textContent+=m.line+'\\n'; logsEl.scrollTop=logsEl.scrollHeight;};
 validateForm();
 refresh(); setInterval(refresh,3000);
 </script></body></html>`);
