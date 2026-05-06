@@ -33,3 +33,4 @@ Use mode selector:
 - headless test
 - hybrid (browser + k6)
 - k6 test
+# load-test
