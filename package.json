@@ -1,0 +1,20 @@
+{
+  "name": "ielts-load-runner",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "e2e:live-runner": "tsx e2e/prod-load/live-multi-user-runner.ts",
+    "k6:start-exam": "k6 run k6/prod-start-exam-200.js",
+    "e2e:live-with-k6": "sh -c 'TS=$(date +%s); LOG_DIR=${LOG_DIR:-.generated/live-runner}; mkdir -p \"$LOG_DIR\"; K6_LOG_FILE=${K6_LOG_FILE:-$LOG_DIR/k6-$TS.log}; LIVE_RUN_LOG_FILE=${LIVE_RUN_LOG_FILE:-$LOG_DIR/live-runner-$TS.log}; echo \"[combo] k6 log: $K6_LOG_FILE\"; echo \"[combo] live log: $LIVE_RUN_LOG_FILE\"; k6 run \"${K6_SCRIPT:-k6/prod-start-exam-200.js}\" > \"$K6_LOG_FILE\" 2>&1 & K6_PID=$!; LIVE_RUN_LOG_FILE=\"$LIVE_RUN_LOG_FILE\" npm run e2e:live-runner; STATUS=$?; kill $K6_PID >/dev/null 2>&1 || true; wait $K6_PID >/dev/null 2>&1 || true; exit $STATUS'",
+    "ui": "node ui-server.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.59.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2"
+  }
+}
