@@ -34,3 +34,4 @@ Use mode selector:
 - hybrid (browser + k6)
 - k6 test
 # load-test
+# load-test
