@@ -205,6 +205,16 @@ app.post('/api/start', (req, res) => {
 
   if (mode === 'headless') env.HEADED_USERS = '0';
   if (mode === 'headed') env.HEADED_USERS = String(Math.max(1, Number(env.HEADED_USERS || '1')));
+  if (!hasDisplay && wantsHeaded && mode !== 'k6') {
+    const requestedConcurrent = Math.max(1, Number(env.MAX_CONCURRENT_USERS || '10'));
+    const safeConcurrent = Number(process.env.HEADED_SAFE_MAX_CONCURRENT || 10);
+    if (requestedConcurrent > safeConcurrent) {
+      pushLog(
+        `[warn] Headed concurrency ${requestedConcurrent} is too high for no-display runtime; capping MAX_CONCURRENT_USERS=${safeConcurrent}.`,
+      );
+      env.MAX_CONCURRENT_USERS = String(safeConcurrent);
+    }
+  }
 
   let cmd = ['npm', 'run', 'e2e:live-runner'];
   if (mode === 'hybrid') cmd = ['npm', 'run', 'e2e:live-with-k6'];
@@ -218,7 +228,7 @@ app.post('/api/start', (req, res) => {
       });
     }
     pushLog('[info] No DISPLAY found; running headed browser under xvfb-run virtual display.');
-    cmd = ['xvfb-run', '-a', ...cmd];
+    cmd = ['xvfb-run', '-a', '--server-args=-screen 0 1920x1080x24', ...cmd];
   }
 
   liveCards.clear();

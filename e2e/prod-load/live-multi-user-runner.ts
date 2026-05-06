@@ -101,6 +101,25 @@ function computeMedian(values: number[]): number {
   return sorted[mid];
 }
 
+async function withTimeout<T>(label: string, promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return await new Promise<T>((resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label}_TIMEOUT_${timeoutMs}MS`));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        if (timer) clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function defaultLoginOrRegister(page: Page, user: VirtualUser, registerUrl: string): Promise<void> {
   const entryUrl = registerUrl.replace(/\/register\/?$/i, '');
   await page.goto(entryUrl, { waitUntil: 'domcontentloaded' });
@@ -466,6 +485,8 @@ async function run(): Promise<void> {
 
   const parsed = parseExamRegisterUrl(config.registerUrl);
   const users = loadUsersFromFile(config.usersFile, config.userCount, config.userOffset);
+  const browserLaunchTimeoutMs = Math.max(10_000, num('BROWSER_LAUNCH_TIMEOUT_MS', 90_000));
+  const contextCreateTimeoutMs = Math.max(10_000, num('CONTEXT_CREATE_TIMEOUT_MS', 45_000));
 
   fs.mkdirSync(path.resolve(process.cwd(), config.outputDir), { recursive: true });
   const liveLogFile =
@@ -488,10 +509,25 @@ async function run(): Promise<void> {
   console.log(`[live-runner] events: ${liveLogFile}`);
 
   const dashboard = createMirroredBroadcaster(startLiveDashboardServer(config.dashboardPort));
+  console.log(
+    `[live-runner] launch config: headless=${String(config.headless)} headedUsers=${String(config.headedUsers)} maxConcurrent=${String(config.maxConcurrentUsers)}`,
+  );
   const headlessBrowser =
-    config.headless || config.headedUsers < users.length ? await chromium.launch({ headless: true }) : null;
+    config.headless || config.headedUsers < users.length
+      ? await withTimeout(
+          'HEADLESS_BROWSER_LAUNCH',
+          chromium.launch({ headless: true }),
+          browserLaunchTimeoutMs,
+        )
+      : null;
   const headedBrowser =
-    !config.headless || config.headedUsers > 0 ? await chromium.launch({ headless: false }) : null;
+    !config.headless || config.headedUsers > 0
+      ? await withTimeout(
+          'HEADED_BROWSER_LAUNCH',
+          chromium.launch({ headless: false }),
+          browserLaunchTimeoutMs,
+        )
+      : null;
   const results: UserResult[] = [];
 
   const ctx: ScenarioContext = {
@@ -536,8 +572,13 @@ async function run(): Promise<void> {
         throw new Error(`BROWSER_MODE_UNAVAILABLE: useHeaded=${String(useHeaded)}`);
       }
 
-      context = await selectedBrowser.newContext({ viewport: { width: 1280, height: 720 } });
-      page = await context.newPage();
+      setPhase('registering', 'starting_browser');
+      context = await withTimeout(
+        `NEW_CONTEXT_${user.userId}`,
+        selectedBrowser.newContext({ viewport: { width: 1280, height: 720 } }),
+        contextCreateTimeoutMs,
+      );
+      page = await withTimeout(`NEW_PAGE_${user.userId}`, context.newPage(), contextCreateTimeoutMs);
       page.setDefaultTimeout(config.navTimeoutMs);
 
       setPhase('registering', 'starting');
