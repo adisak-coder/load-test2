@@ -21,6 +21,13 @@ Important limits:
   - threshold: `section_transition_ms max < 2000`
   - requires a schedule that accepts section override actions; authentic IELTS mode rejects the endpoint
 
+- `k6/prod-transition-reconciliation-200.js`
+  - 200 students
+  - forced section transition while students keep typing mutations with randomized cadence
+  - verifies last accepted pre-transition and post-transition values are still present in attempt state
+  - thresholds: `transition_reconcile_missing_answers count == 0`, `transition_reconcile_failures count == 0`
+  - this is the exam-day canary for section-boundary loss/regression
+
 - `k6/prod-submit-storm-200.js`
   - 200 students
   - near-simultaneous submit storm
@@ -77,6 +84,18 @@ K6_CONFIRM_PROD=true \
 K6_STUDENTS=200 \
 K6_CHECKED_IN_THRESHOLD=200 \
 k6 run k6/prod-section-transition-200.js
+```
+
+Section transition reconciliation canary:
+
+```bash
+K6_CONFIRM_PROD=true \
+K6_STUDENTS=200 \
+K6_CHECKED_IN_THRESHOLD=200 \
+K6_TYPING_CADENCE_MIN_MS=90 \
+K6_TYPING_CADENCE_MAX_MS=240 \
+K6_POST_TRANSITION_TYPING_SECONDS=15 \
+k6 run k6/prod-transition-reconciliation-200.js
 ```
 
 Submit storm:

@@ -4,6 +4,8 @@ import { chromium, type Browser, type BrowserContext, type Page } from 'playwrig
 import { parseExamRegisterUrl } from './exam-url';
 import { loadUsersFromFile, type VirtualUser } from './user-source';
 import { startLiveDashboardServer, type DashboardEvent } from './live-dashboard-server';
+import { installStudentAnswerCapture } from './student-answer-capture';
+import { createGradingVerifier } from './grading-verifier';
 
 export interface RunnerConfig {
   registerUrl: string;
@@ -23,6 +25,10 @@ export interface RunnerConfig {
   logFile: string;
   userOffset: number;
   deleteArtifactsOnFinish: boolean;
+  gradingVerifyEnabled: boolean;
+  gradingVerifyStrict: boolean;
+  gradingVerifyAdminEmail: string;
+  gradingVerifyAdminPassword: string;
 }
 
 export interface ScenarioContext {
@@ -96,28 +102,44 @@ function computeMedian(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const mid = Math.floor(sorted.length / 2);
   if (sorted.length % 2 === 0) {
-    return Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+    const left = sorted[mid - 1] ?? 0;
+    const right = sorted[mid] ?? left;
+    return Math.round((left + right) / 2);
   }
-  return sorted[mid];
+  return sorted[mid] ?? 0;
 }
 
-async function withTimeout<T>(label: string, promise: Promise<T>, timeoutMs: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  return await new Promise<T>((resolve, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${label}_TIMEOUT_${timeoutMs}MS`));
-    }, timeoutMs);
-    promise.then(
-      (value) => {
-        if (timer) clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        if (timer) clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
+function findSubmissionIdDeep(value: unknown, depth = 0): string | null {
+  if (depth > 8 || value == null) return null;
+  if (typeof value === 'string') {
+    return /^sub[-_]/i.test(value) ? value : null;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findSubmissionIdDeep(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value !== 'object') return null;
+  const record = value as Record<string, unknown>;
+  const direct = record['submissionId'];
+  if (typeof direct === 'string' && direct.length > 0) return direct;
+  const finalSubmission = record['finalSubmission'];
+  if (finalSubmission && typeof finalSubmission === 'object') {
+    const nested = (finalSubmission as Record<string, unknown>)['submissionId'];
+    if (typeof nested === 'string' && nested.length > 0) return nested;
+  }
+  for (const nestedValue of Object.values(record)) {
+    const found = findSubmissionIdDeep(nestedValue, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function isUuid(value: string | null): value is string {
+  if (!value) return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 async function defaultLoginOrRegister(page: Page, user: VirtualUser, registerUrl: string): Promise<void> {
@@ -221,7 +243,7 @@ async function defaultLoginOrRegister(page: Page, user: VirtualUser, registerUrl
 
   const continueButton = page.getByRole('button', { name: /continue|register|start|enter|join|sign in|login/i }).first();
   if (await continueButton.count()) {
-    await continueButton.click();
+    await continueButton.click({ noWaitAfter: true, timeout: 5000 }).catch(() => {});
   } else {
     await page.keyboard.press('Enter').catch(() => {});
   }
@@ -249,7 +271,7 @@ async function defaultLoginOrRegister(page: Page, user: VirtualUser, registerUrl
       })
       .first();
     if (await proceedButton.count()) {
-      await proceedButton.click().catch(() => {});
+      await proceedButton.click({ noWaitAfter: true, timeout: 5000 }).catch(() => {});
     }
 
     await page.waitForTimeout(500);
@@ -269,7 +291,7 @@ async function defaultLoginOrRegister(page: Page, user: VirtualUser, registerUrl
     }
     const retryButton = page.getByRole('button', { name: /continue|register|start|enter|join|sign in|login/i }).first();
     if (await retryButton.count()) {
-      await retryButton.click().catch(() => {});
+      await retryButton.click({ noWaitAfter: true, timeout: 5000 }).catch(() => {});
     }
     await page.waitForTimeout(400);
   }
@@ -302,7 +324,7 @@ async function defaultWaitForExamLive(page: Page, ctx: ScenarioContext): Promise
         })
         .first();
       if (await proceedButton.count()) {
-        await proceedButton.click().catch(() => {});
+        await proceedButton.click({ noWaitAfter: true, timeout: 5000 }).catch(() => {});
       }
     }
 
@@ -310,17 +332,27 @@ async function defaultWaitForExamLive(page: Page, ctx: ScenarioContext): Promise
       return;
     }
 
-    const runtime = await page.evaluate(async ({ origin, scheduleId }) => {
+    const live = await page.evaluate(async ({ origin, scheduleId }) => {
       try {
-        const res = await fetch(`${origin}/api/v1/schedules/${scheduleId}/runtime`, { credentials: 'include' });
-        if (!res.ok) return null;
-        return await res.json();
+        const res = await fetch(`${origin}/api/v1/student/sessions/${scheduleId}/live`, {
+          credentials: 'include',
+        });
+        if (!res.ok) {
+          return { ok: false, status: res.status };
+        }
+        return { ok: true, payload: await res.json() };
       } catch {
         return null;
       }
     }, { origin: ctx.origin, scheduleId: ctx.scheduleId }).catch(() => null);
 
-    const status = runtime && typeof runtime === 'object' ? (runtime as { status?: string }).status : null;
+    const livePayload = live && typeof live === 'object'
+      ? (live as { payload?: { data?: { runtime?: { status?: string } } | { status?: string } } }).payload
+      : null;
+    const runtime = livePayload && typeof livePayload === 'object' && 'data' in livePayload
+      ? (livePayload as { data?: { runtime?: { status?: string } } }).data?.runtime
+      : (livePayload as { runtime?: { status?: string } } | null)?.runtime;
+    const status = runtime && typeof runtime === 'object' ? runtime.status ?? null : null;
     if (status === 'live') {
       return;
     }
@@ -333,6 +365,7 @@ async function defaultWaitForExamLive(page: Page, ctx: ScenarioContext): Promise
 
 async function defaultRunExamActions(page: Page, user: VirtualUser, ctx: ScenarioContext): Promise<void> {
   const started = Date.now();
+  let writes = 0;
   while (Date.now() - started < ctx.config.examTimeoutMs) {
     const completeHeading = page.getByRole('heading', { name: /Examination Complete!/i });
     if (await completeHeading.isVisible().catch(() => false)) {
@@ -352,57 +385,68 @@ async function defaultRunExamActions(page: Page, user: VirtualUser, ctx: Scenari
 
     const finishButton = page.getByRole('button', { name: 'Finish' }).first();
     if (await finishButton.isVisible().catch(() => false)) {
-      await finishButton.click().catch(() => finishButton.click({ force: true }));
+      await finishButton
+        .click({ noWaitAfter: true, timeout: 5000 })
+        .catch(() => finishButton.click({ force: true, noWaitAfter: true, timeout: 5000 }));
       await page.waitForTimeout(500);
       continue;
     }
 
     const reviewSubmit = page.getByRole('button', { name: 'Review & Submit' }).first();
     if (await reviewSubmit.isVisible().catch(() => false)) {
-      await reviewSubmit.click().catch(() => reviewSubmit.click({ force: true }));
+      await reviewSubmit
+        .click({ noWaitAfter: true, timeout: 5000 })
+        .catch(() => reviewSubmit.click({ force: true, noWaitAfter: true, timeout: 5000 }));
       await page.waitForTimeout(500);
       continue;
     }
 
     const submitSection = page.getByRole('button', { name: 'Submit Section' }).first();
     if (await submitSection.isVisible().catch(() => false)) {
-      await submitSection.click().catch(() => submitSection.click({ force: true }));
+      await submitSection
+        .click({ noWaitAfter: true, timeout: 5000 })
+        .catch(() => submitSection.click({ force: true, noWaitAfter: true, timeout: 5000 }));
       await page.waitForTimeout(500);
       continue;
     }
 
     const confirmSubmit = page.getByRole('button', { name: 'Confirm Submission' }).first();
     if (await confirmSubmit.isVisible().catch(() => false)) {
-      await confirmSubmit.click().catch(() => confirmSubmit.click({ force: true }));
+      await confirmSubmit
+        .click({ noWaitAfter: true, timeout: 5000 })
+        .catch(() => confirmSubmit.click({ force: true, noWaitAfter: true, timeout: 5000 }));
       await page.waitForTimeout(700);
       continue;
     }
 
-    const answerBox = page.getByLabel(/Answer for question/i).first();
-    if (await answerBox.isVisible().catch(() => false)) {
-      await answerBox.fill(`auto-answer-${user.userId}-${Math.floor(Math.random() * 1000)}`).catch(() => {});
-      await page.waitForTimeout(350);
-      continue;
+    const textInputs = page.locator('input[aria-label*="Answer for question" i], textarea[aria-label*="Answer for question" i]');
+    const textCount = await textInputs.count().catch(() => 0);
+    for (let i = 0; i < textCount; i += 1) {
+      const input = textInputs.nth(i);
+      if (!(await input.isVisible().catch(() => false))) continue;
+      await input.fill(`ans-${user.userId}-${writes}`).catch(() => {});
+      writes += 1;
     }
 
-    const writingEditor = page.locator('[contenteditable="true"]').first();
-    if (await writingEditor.isVisible().catch(() => false)) {
-      await writingEditor.click().catch(() => {});
-      await writingEditor.type(`auto-writing-${user.userId} `, { delay: 10 }).catch(() => {});
-      await page.waitForTimeout(350);
-      continue;
+    const writingEditors = page.locator('[contenteditable="true"]');
+    const writingCount = await writingEditors.count().catch(() => 0);
+    for (let i = 0; i < writingCount; i += 1) {
+      const editor = writingEditors.nth(i);
+      if (!(await editor.isVisible().catch(() => false))) continue;
+      await editor.click().catch(() => {});
+      await page.keyboard.press('Control+A').catch(() => {});
+      await page.keyboard.type(`writing-${user.userId}-${writes}`).catch(() => {});
+      writes += 1;
     }
 
     const choice = page.locator('input[type="radio"], input[type="checkbox"]').first();
     if (await choice.isVisible().catch(() => false)) {
       await choice.check().catch(() => {});
-      await page.waitForTimeout(250);
-      continue;
     }
 
     const nextButton = page.getByRole('button', { name: /next|continue|save and next/i }).first();
     if (await nextButton.isVisible().catch(() => false)) {
-      await nextButton.click().catch(() => {});
+      await nextButton.click({ noWaitAfter: true, timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(400);
       continue;
     }
@@ -454,7 +498,7 @@ function createMirroredBroadcaster(base: { broadcast: (event: DashboardEvent) =>
 
 async function run(): Promise<void> {
   const liveMode = resolveLiveMode();
-  let config: RunnerConfig = {
+  const config: RunnerConfig = {
     registerUrl: requireEnv('REGISTER_URL'),
     userCount: num('USER_COUNT', 100),
     usersFile: requireEnv('USERS_FILE'),
@@ -472,21 +516,17 @@ async function run(): Promise<void> {
     logFile: process.env['LIVE_RUN_LOG_FILE'] ?? '',
     userOffset: Math.max(0, num('USER_OFFSET', 0)),
     deleteArtifactsOnFinish: bool('DELETE_ARTIFACTS_ON_FINISH', false),
+    gradingVerifyEnabled: bool('GRADING_VERIFY_ENABLED', false),
+    gradingVerifyStrict: bool('GRADING_VERIFY_STRICT', true),
+    gradingVerifyAdminEmail: process.env['GRADING_VERIFY_ADMIN_EMAIL']?.trim() ?? '',
+    gradingVerifyAdminPassword: process.env['GRADING_VERIFY_ADMIN_PASSWORD'] ?? '',
   };
-  const hasDisplay = Boolean(process.env['DISPLAY'] || process.env['WAYLAND_DISPLAY']);
-  if (!hasDisplay && (!config.headless || config.headedUsers > 0)) {
-    console.warn('[live-runner] no DISPLAY/WAYLAND_DISPLAY detected; forcing headless mode');
-    config = {
-      ...config,
-      headless: true,
-      headedUsers: 0,
-    };
+  if (config.gradingVerifyEnabled && (!config.gradingVerifyAdminEmail || !config.gradingVerifyAdminPassword)) {
+    throw new Error('GRADING_VERIFY_ADMIN_EMAIL and GRADING_VERIFY_ADMIN_PASSWORD are required when GRADING_VERIFY_ENABLED=true');
   }
 
   const parsed = parseExamRegisterUrl(config.registerUrl);
   const users = loadUsersFromFile(config.usersFile, config.userCount, config.userOffset);
-  const browserLaunchTimeoutMs = Math.max(10_000, num('BROWSER_LAUNCH_TIMEOUT_MS', 90_000));
-  const contextCreateTimeoutMs = Math.max(10_000, num('CONTEXT_CREATE_TIMEOUT_MS', 45_000));
 
   fs.mkdirSync(path.resolve(process.cwd(), config.outputDir), { recursive: true });
   const liveLogFile =
@@ -509,26 +549,19 @@ async function run(): Promise<void> {
   console.log(`[live-runner] events: ${liveLogFile}`);
 
   const dashboard = createMirroredBroadcaster(startLiveDashboardServer(config.dashboardPort));
-  console.log(
-    `[live-runner] launch config: headless=${String(config.headless)} headedUsers=${String(config.headedUsers)} maxConcurrent=${String(config.maxConcurrentUsers)}`,
-  );
   const headlessBrowser =
-    config.headless || config.headedUsers < users.length
-      ? await withTimeout(
-          'HEADLESS_BROWSER_LAUNCH',
-          chromium.launch({ headless: true }),
-          browserLaunchTimeoutMs,
-        )
-      : null;
+    config.headless || config.headedUsers < users.length ? await chromium.launch({ headless: true }) : null;
   const headedBrowser =
-    !config.headless || config.headedUsers > 0
-      ? await withTimeout(
-          'HEADED_BROWSER_LAUNCH',
-          chromium.launch({ headless: false }),
-          browserLaunchTimeoutMs,
-        )
-      : null;
+    !config.headless || config.headedUsers > 0 ? await chromium.launch({ headless: false }) : null;
   const results: UserResult[] = [];
+  const gradingVerifier = config.gradingVerifyEnabled
+    ? await createGradingVerifier({
+      origin: parsed.origin,
+      adminEmail: config.gradingVerifyAdminEmail,
+      adminPassword: config.gradingVerifyAdminPassword,
+      strict: config.gradingVerifyStrict,
+    })
+    : null;
 
   const ctx: ScenarioContext = {
     origin: parsed.origin,
@@ -547,10 +580,11 @@ async function run(): Promise<void> {
     let phase: Phase = 'booting';
     let context: BrowserContext | null = null;
     let page: Page | null = null;
+    let answerCapture: ReturnType<typeof installStudentAnswerCapture> | null = null;
     let frameInFlight = false;
     let stopCapture = false;
 
-    const setPhase = (next: Phase, status = next, error?: string) => {
+    const setPhase = (next: Phase, status: string = next, error?: string) => {
       phase = next;
       dashboard.broadcast(eventBase(user.userId, status, phase, error));
       const line = JSON.stringify({
@@ -572,14 +606,10 @@ async function run(): Promise<void> {
         throw new Error(`BROWSER_MODE_UNAVAILABLE: useHeaded=${String(useHeaded)}`);
       }
 
-      setPhase('registering', 'starting_browser');
-      context = await withTimeout(
-        `NEW_CONTEXT_${user.userId}`,
-        selectedBrowser.newContext({ viewport: { width: 1280, height: 720 } }),
-        contextCreateTimeoutMs,
-      );
-      page = await withTimeout(`NEW_PAGE_${user.userId}`, context.newPage(), contextCreateTimeoutMs);
+      context = await selectedBrowser.newContext({ viewport: { width: 1280, height: 720 } });
+      page = await context.newPage();
       page.setDefaultTimeout(config.navTimeoutMs);
+      answerCapture = installStudentAnswerCapture(page);
 
       setPhase('registering', 'starting');
       await defaultScenario.prepare(page, user, ctx);
@@ -616,6 +646,61 @@ async function run(): Promise<void> {
       await defaultScenario.execute(page, user, ctx);
       await defaultScenario.finalize(page, user, ctx);
 
+      if (gradingVerifier && answerCapture) {
+        let submissionId = answerCapture.getSubmissionId();
+        if (!submissionId) {
+          const sessionSnapshot = await page.evaluate(async ({ origin, scheduleId }) => {
+            try {
+              const res = await fetch(`${origin}/api/v1/student/sessions/${scheduleId}`, { credentials: 'include' });
+              if (!res.ok) return null;
+              return await res.json();
+            } catch {
+              return null;
+            }
+          }, { origin: ctx.origin, scheduleId: ctx.scheduleId }).catch(() => null);
+          submissionId = findSubmissionIdDeep(sessionSnapshot);
+        }
+        if (!isUuid(submissionId)) {
+          submissionId = await gradingVerifier.findLatestSubmissionIdForStudent(ctx.scheduleId, [
+            user.candidateId ?? '',
+            user.email,
+            user.userId,
+          ]);
+        }
+        if (!isUuid(submissionId)) {
+          throw new Error('GRADING_VERIFY_NO_SUBMISSION_ID: unable to resolve UUID grading submission for student.');
+        }
+        const verifyResult = await gradingVerifier.verifySubmission(submissionId, answerCapture.expected);
+        if (!verifyResult.ok) {
+          const preview = verifyResult.mismatches
+            .slice(0, 5)
+            .map((item) => `${item.kind}:${item.id}`)
+            .join(', ');
+          throw new Error(
+            `GRADING_VERIFY_MISMATCH: submissionId=${submissionId} mismatches=${verifyResult.mismatches.length} [${preview}]`,
+          );
+        }
+        const verifyOkLine = JSON.stringify({
+          ts: new Date().toISOString(),
+          userId: user.userId,
+          scheduleId: ctx.scheduleId,
+          event: 'GRADING_VERIFY_OK',
+          submissionId,
+          mismatches: verifyResult.mismatches.length,
+        });
+        console.log(verifyOkLine);
+        appendLog(verifyOkLine);
+      } else {
+        const verifySkippedLine = JSON.stringify({
+          ts: new Date().toISOString(),
+          userId: user.userId,
+          scheduleId: ctx.scheduleId,
+          event: 'GRADING_VERIFY_SKIPPED',
+        });
+        console.log(verifySkippedLine);
+        appendLog(verifySkippedLine);
+      }
+
       setPhase('done', 'done');
       stopCapture = true;
       await captureLoop.catch(() => {});
@@ -640,6 +725,7 @@ async function run(): Promise<void> {
       });
     } finally {
       stopCapture = true;
+      answerCapture?.dispose();
       if (page) await page.close().catch(() => {});
       if (context) await context.close().catch(() => {});
     }
@@ -658,6 +744,7 @@ async function run(): Promise<void> {
   } finally {
     if (headedBrowser) await headedBrowser.close();
     if (headlessBrowser) await headlessBrowser.close();
+    await gradingVerifier?.dispose();
   }
 
   const ok = results.filter((r) => r.ok);

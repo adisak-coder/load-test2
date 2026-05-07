@@ -93,13 +93,14 @@ export function loadUsersFromFile(filePath: string, requiredCount: number, userO
   const emailSet = new Set<string>();
   const userIdSet = new Set<string>();
   for (const user of users) {
-    if (emailSet.has(user.email)) {
+    const normalizedEmail = user.email.trim().toLowerCase();
+    if (emailSet.has(normalizedEmail)) {
       throw new Error(`Duplicate email in USERS_FILE: ${user.email}`);
     }
     if (userIdSet.has(user.userId)) {
       throw new Error(`Duplicate userId in USERS_FILE: ${user.userId}`);
     }
-    emailSet.add(user.email);
+    emailSet.add(normalizedEmail);
     userIdSet.add(user.userId);
   }
 
