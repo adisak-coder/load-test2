@@ -24,6 +24,7 @@ export interface RunnerConfig {
   maxConcurrentUsers: number;
   logFile: string;
   userOffset: number;
+  lastAnswerCsvFile: string;
   deleteArtifactsOnFinish: boolean;
   gradingVerifyEnabled: boolean;
   gradingVerifyStrict: boolean;
@@ -109,6 +110,10 @@ function computeMedian(values: number[]): number {
   return sorted[mid] ?? 0;
 }
 
+function csvEscape(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
 function findSubmissionIdDeep(value: unknown, depth = 0): string | null {
   if (depth > 8 || value == null) return null;
   if (typeof value === 'string') {
@@ -135,6 +140,10 @@ function findSubmissionIdDeep(value: unknown, depth = 0): string | null {
     if (found) return found;
   }
   return null;
+}
+
+function isSubmissionId(value: string | null): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function isUuid(value: string | null): value is string {
@@ -383,6 +392,66 @@ async function defaultRunExamActions(page: Page, user: VirtualUser, ctx: Scenari
       continue;
     }
 
+    const textInputs = page.locator('input[aria-label*="Answer for question" i], textarea[aria-label*="Answer for question" i]');
+    const textCount = await textInputs.count().catch(() => 0);
+    for (let i = 0; i < textCount; i += 1) {
+      const input = textInputs.nth(i);
+      if (!(await input.isVisible().catch(() => false))) continue;
+      await input.fill(`ans-${user.userId}-${writes}`).catch(() => {});
+      writes += 1;
+    }
+
+    const writeIntoEditor = async (value: string): Promise<boolean> => {
+      const writingInput = page
+        .locator('textarea[aria-label="Writing response"], textarea[aria-label*="writing response" i], [contenteditable="true"]')
+        .first();
+      if (!(await writingInput.isVisible().catch(() => false))) return false;
+      await writingInput.click().catch(() => {});
+      await writingInput.fill(value).catch(() => {});
+      await writingInput.press('End').catch(() => {});
+      await writingInput.type(' ').catch(() => {});
+      await writingInput.press('Backspace').catch(() => {});
+      await writingInput
+        .evaluate((node, text) => {
+          if (!(node instanceof HTMLElement)) return;
+          const target = node as HTMLInputElement | HTMLTextAreaElement;
+          if ('value' in target) {
+            target.value = text;
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            return;
+          }
+          if (node.isContentEditable) {
+            node.textContent = text;
+            node.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }));
+          }
+        }, value)
+        .catch(() => {});
+      return true;
+    };
+
+    const writingTaskButtons = page.getByRole('button', { name: /^Task\s*\d+$/i });
+    const writingTaskCount = await writingTaskButtons.count().catch(() => 0);
+    if (writingTaskCount > 0) {
+      for (let i = 0; i < writingTaskCount; i += 1) {
+        const taskButton = writingTaskButtons.nth(i);
+        if (!(await taskButton.isVisible().catch(() => false))) continue;
+        await taskButton.click({ timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(120);
+        const writingValue = `writing-${user.userId}-task${i + 1}-${writes}`;
+        const wrote = await writeIntoEditor(writingValue);
+        if (wrote) {
+          writes += 1;
+        }
+      }
+    } else {
+      const writingValue = `writing-${user.userId}-${writes}`;
+      const wrote = await writeIntoEditor(writingValue);
+      if (wrote) {
+        writes += 1;
+      }
+    }
+
     const finishButton = page.getByRole('button', { name: 'Finish' }).first();
     if (await finishButton.isVisible().catch(() => false)) {
       await finishButton
@@ -419,26 +488,6 @@ async function defaultRunExamActions(page: Page, user: VirtualUser, ctx: Scenari
       continue;
     }
 
-    const textInputs = page.locator('input[aria-label*="Answer for question" i], textarea[aria-label*="Answer for question" i]');
-    const textCount = await textInputs.count().catch(() => 0);
-    for (let i = 0; i < textCount; i += 1) {
-      const input = textInputs.nth(i);
-      if (!(await input.isVisible().catch(() => false))) continue;
-      await input.fill(`ans-${user.userId}-${writes}`).catch(() => {});
-      writes += 1;
-    }
-
-    const writingEditors = page.locator('[contenteditable="true"]');
-    const writingCount = await writingEditors.count().catch(() => 0);
-    for (let i = 0; i < writingCount; i += 1) {
-      const editor = writingEditors.nth(i);
-      if (!(await editor.isVisible().catch(() => false))) continue;
-      await editor.click().catch(() => {});
-      await page.keyboard.press('Control+A').catch(() => {});
-      await page.keyboard.type(`writing-${user.userId}-${writes}`).catch(() => {});
-      writes += 1;
-    }
-
     const choice = page.locator('input[type="radio"], input[type="checkbox"]').first();
     if (await choice.isVisible().catch(() => false)) {
       await choice.check().catch(() => {});
@@ -465,6 +514,32 @@ const defaultScenario: ScenarioPlugin = {
 
 function eventBase(userId: string, status: string, phase: Phase, error?: string): DashboardEvent {
   return { userId, status, phase, lastSeenAt: new Date().toISOString(), ...(error ? { error } : {}) };
+}
+
+function formatWritingProof(
+  comparisons: Array<{ taskId: string; expected: string | null; actual: string; match: boolean }>,
+): string {
+  if (comparisons.length === 0) return 'No writing task rows returned from grading API.';
+  return comparisons
+    .map((item) => {
+      const flag = item.match ? 'OK' : 'DIFF';
+      const expected = item.expected ?? '<missing in runner capture>';
+      return `[${flag}] ${item.taskId}\nexpected: ${expected}\nactual:   ${item.actual}`;
+    })
+    .join('\n\n');
+}
+
+function formatBotAnswersProof(expected: { answers: Record<string, unknown>; writingAnswers: Record<string, string> }): string {
+  const answerRows = Object.entries(expected.answers)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([id, value]) => `Q ${id}: ${typeof value === 'string' ? value : JSON.stringify(value)}`);
+  const writingRows = Object.entries(expected.writingAnswers)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([id, value]) => `W ${id}: ${value}`);
+
+  const objectiveBlock = answerRows.length > 0 ? answerRows.join('\n') : '<no objective answers captured>';
+  const writingBlock = writingRows.length > 0 ? writingRows.join('\n') : '<no writing answers captured>';
+  return `Objective Answers:\n${objectiveBlock}\n\nWriting Answers:\n${writingBlock}`;
 }
 
 function createMirroredBroadcaster(base: { broadcast: (event: DashboardEvent) => void }): {
@@ -515,6 +590,7 @@ async function run(): Promise<void> {
     maxConcurrentUsers: Math.max(1, num('MAX_CONCURRENT_USERS', 20)),
     logFile: process.env['LIVE_RUN_LOG_FILE'] ?? '',
     userOffset: Math.max(0, num('USER_OFFSET', 0)),
+    lastAnswerCsvFile: process.env['LAST_ANSWER_CSV_FILE']?.trim() ?? '',
     deleteArtifactsOnFinish: bool('DELETE_ARTIFACTS_ON_FINISH', false),
     gradingVerifyEnabled: bool('GRADING_VERIFY_ENABLED', false),
     gradingVerifyStrict: bool('GRADING_VERIFY_STRICT', true),
@@ -537,6 +613,33 @@ async function run(): Promise<void> {
   const appendLog = (line: string) => {
     fs.appendFileSync(liveLogFile, `${line}\n`);
   };
+  const lastAnswerCsvPath =
+    config.lastAnswerCsvFile.length > 0
+      ? path.resolve(process.cwd(), config.lastAnswerCsvFile)
+      : path.resolve(process.cwd(), config.outputDir, `live-run-last-answers-${Date.now()}.csv`);
+  fs.mkdirSync(path.dirname(lastAnswerCsvPath), { recursive: true });
+  const csvHeader = 'ts,userId,scheduleId,status,error,answersJson,writingAnswersJson';
+  fs.writeFileSync(lastAnswerCsvPath, `${csvHeader}\n`);
+  const appendLastAnswerRow = (input: {
+    userId: string;
+    status: 'done' | 'failed';
+    error?: string;
+    answersJson: string;
+    writingAnswersJson: string;
+  }) => {
+    const row = [
+      new Date().toISOString(),
+      input.userId,
+      parsed.scheduleId,
+      input.status,
+      input.error ?? '',
+      input.answersJson,
+      input.writingAnswersJson,
+    ]
+      .map(csvEscape)
+      .join(',');
+    fs.appendFileSync(lastAnswerCsvPath, `${row}\n`);
+  };
   appendLog(
     JSON.stringify({
       ts: new Date().toISOString(),
@@ -544,9 +647,11 @@ async function run(): Promise<void> {
       scheduleId: parsed.scheduleId,
       userOffset: config.userOffset,
       userCount: config.userCount,
+      lastAnswerCsvPath,
     }),
   );
   console.log(`[live-runner] events: ${liveLogFile}`);
+  console.log(`[live-runner] last answers csv: ${lastAnswerCsvPath}`);
 
   const dashboard = createMirroredBroadcaster(startLiveDashboardServer(config.dashboardPort));
   const headlessBrowser =
@@ -645,6 +750,11 @@ async function run(): Promise<void> {
 
       await defaultScenario.execute(page, user, ctx);
       await defaultScenario.finalize(page, user, ctx);
+      const botAnswersProof = formatBotAnswersProof(answerCapture.expected);
+      dashboard.broadcast({
+        ...eventBase(user.userId, 'answers_captured', phase),
+        comparison: { botAnswersProof },
+      });
 
       if (gradingVerifier && answerCapture) {
         let submissionId = answerCapture.getSubmissionId();
@@ -661,16 +771,38 @@ async function run(): Promise<void> {
           submissionId = findSubmissionIdDeep(sessionSnapshot);
         }
         if (!isUuid(submissionId)) {
-          submissionId = await gradingVerifier.findLatestSubmissionIdForStudent(ctx.scheduleId, [
-            user.candidateId ?? '',
-            user.email,
-            user.userId,
-          ]);
+          const candidates = [user.candidateId ?? '', user.email, user.userId];
+          const deadlineMs = Date.now() + 20_000;
+          while (!isUuid(submissionId) && Date.now() < deadlineMs) {
+            submissionId = await gradingVerifier.findLatestSubmissionIdForStudent(ctx.scheduleId, candidates);
+            if (isUuid(submissionId)) break;
+            await page.waitForTimeout(1000).catch(() => {});
+          }
         }
         if (!isUuid(submissionId)) {
           throw new Error('GRADING_VERIFY_NO_SUBMISSION_ID: unable to resolve UUID grading submission for student.');
         }
         const verifyResult = await gradingVerifier.verifySubmission(submissionId, answerCapture.expected);
+        const writingProof = formatWritingProof(verifyResult.writingComparisons);
+        const sameCount = verifyResult.writingComparisons.filter((item) => item.match).length;
+        const diffCount = verifyResult.writingComparisons.length - sameCount;
+        dashboard.broadcast({
+          ...eventBase(user.userId, verifyResult.ok ? 'grading_verified' : 'grading_mismatch', phase),
+          comparison: { submissionId, writingProof, botAnswersProof, sameCount, diffCount },
+          metrics: { writingComparedTasks: verifyResult.writingComparisons.length, mismatches: verifyResult.mismatches.length },
+        });
+        appendLog(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            userId: user.userId,
+            scheduleId: ctx.scheduleId,
+            event: 'GRADING_VERIFY_COMPARE',
+            submissionId,
+            writingComparedTasks: verifyResult.writingComparisons.length,
+            mismatches: verifyResult.mismatches.length,
+            writingComparisons: verifyResult.writingComparisons,
+          }),
+        );
         if (!verifyResult.ok) {
           const preview = verifyResult.mismatches
             .slice(0, 5)
@@ -712,6 +844,12 @@ async function run(): Promise<void> {
         joinMs: Math.max(0, startedExamAt - startedAt),
         startMs: Math.max(0, Date.now() - startedAt),
       });
+      appendLastAnswerRow({
+        userId: user.userId,
+        status: 'done',
+        answersJson: JSON.stringify(answerCapture?.expected.answers ?? {}),
+        writingAnswersJson: JSON.stringify(answerCapture?.expected.writingAnswers ?? {}),
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setPhase('failed', 'failed', message);
@@ -722,6 +860,13 @@ async function run(): Promise<void> {
         joinMs: Math.max(0, startedExamAt ? startedExamAt - startedAt : 0),
         startMs: Math.max(0, Date.now() - startedAt),
         error: message,
+      });
+      appendLastAnswerRow({
+        userId: user.userId,
+        status: 'failed',
+        error: message,
+        answersJson: JSON.stringify(answerCapture?.expected.answers ?? {}),
+        writingAnswersJson: JSON.stringify(answerCapture?.expected.writingAnswers ?? {}),
       });
     } finally {
       stopCapture = true;
@@ -766,6 +911,7 @@ async function run(): Promise<void> {
   const summaryPath = path.resolve(process.cwd(), config.outputDir, `live-run-summary-${Date.now()}.json`);
   fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
   console.log(`[live-runner] summary: ${summaryPath}`);
+  console.log(`[live-runner] last answers csv: ${lastAnswerCsvPath}`);
   appendLog(JSON.stringify({ ts: new Date().toISOString(), event: 'live_runner_summary', summaryPath, liveLogFile }));
   if (config.deleteArtifactsOnFinish) {
     try {
